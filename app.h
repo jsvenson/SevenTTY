@@ -77,6 +77,11 @@ struct session
 	char* recv_buffer;
 	char* send_buffer;
 
+	// OT connect timeout state (used only while blocking OTConnect).
+	// Per-session so concurrent connects don't clobber each other's
+	// notifier state (net.c ssh_ot_notifier / telnet.c tcp_ot_notifier).
+	unsigned long connect_deadline; /* 0 = not connecting */
+
 	// telnet/nc connection (SESSION_TELNET/SESSION_NETCAT only)
 	char telnet_host[256];
 	unsigned short telnet_port;

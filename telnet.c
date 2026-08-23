@@ -83,41 +83,41 @@ void tcp_output_callback(const char *s, size_t len, void *user)
 /* ------------------------------------------------------------------ */
 
 /* connect timeout: 30 seconds (1800 ticks).  set before OTConnect,
-   cleared after.  the notifier cancels the blocking call if exceeded. */
+   cleared after.  the notifier cancels the blocking call if exceeded.
+   Stored per-session (sessions[].connect_deadline) so concurrent
+   telnet/nc connects don't clobber each other's notifier state. */
 #define TCP_CONNECT_TIMEOUT  1800
-unsigned long tcp_connect_deadline = 0;
-EndpointRef tcp_connect_ep = kOTInvalidEndpointRef;
-int tcp_connect_session_idx = -1;
 
 /* OT notifier: yields to cooperative threads during blocking calls.
    Called at system task time with kOTSyncIdleEvent when
    OTUseSyncIdleEvents is true, keeping the machine responsive.
-   Also cancels on timeout or when disconnect sets thread_command=EXIT. */
+   Also cancels on timeout or when disconnect sets thread_command=EXIT.
+   `context` is the session index, installed per-endpoint, so each
+   connecting session tracks its own deadline. */
 pascal void tcp_ot_notifier(void* context, OTEventCode event,
                                    OTResult result, void* cookie)
 {
-	(void)context;
+	int idx = (int)(intptr_t)context;
+	struct session* s = &sessions[idx];
 	(void)result;
 	(void)cookie;
 	if (event == kOTSyncIdleEvent)
 	{
 		YieldToAnyThread();
-		if (tcp_connect_ep != kOTInvalidEndpointRef)
+		if (s->endpoint != kOTInvalidEndpointRef && s->connect_deadline > 0)
 		{
 			int cancel = 0;
 
 			/* timeout expired */
-			if (tcp_connect_deadline > 0 &&
-			    TickCount() > tcp_connect_deadline)
+			if (TickCount() > s->connect_deadline)
 				cancel = 1;
 
 			/* disconnect requested */
-			if (tcp_connect_session_idx >= 0 &&
-			    sessions[tcp_connect_session_idx].thread_command == EXIT)
+			if (s->thread_command == EXIT)
 				cancel = 1;
 
 			if (cancel)
-				OTCancelSynchronousCalls(tcp_connect_ep, kOTCanceledErr);
+				OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
 		}
 	}
 }
@@ -138,7 +138,8 @@ static int tcp_init_connection(int session_idx, char* hostname)
 
 	OT_CHECK(OTSetSynchronous(s->endpoint));
 	OT_CHECK(OTSetBlocking(s->endpoint));
-	OT_CHECK(OTInstallNotifier(s->endpoint, tcp_ot_notifier, nil));
+	OT_CHECK(OTInstallNotifier(s->endpoint, tcp_ot_notifier,
+	                           (void*)(intptr_t)session_idx));
 	OT_CHECK(OTUseSyncIdleEvents(s->endpoint, true));
 	OT_CHECK(OTBind(s->endpoint, nil, nil));
 
@@ -151,16 +152,14 @@ static int tcp_init_connection(int session_idx, char* hostname)
 
 	/* OTConnect blocks during DNS + TCP handshake.
 	   The idle notifier yields to other threads during the wait.
-	   A 30-second timeout prevents hanging on unreachable hosts. */
-	tcp_connect_ep = s->endpoint;
-	tcp_connect_session_idx = session_idx;
-	tcp_connect_deadline = TickCount() + TCP_CONNECT_TIMEOUT;
+	   A 30-second timeout prevents hanging on unreachable hosts.
+	   Deadline is per-session so a concurrent connect on another
+	   session can't overwrite this one's notifier state. */
+	s->connect_deadline = TickCount() + TCP_CONNECT_TIMEOUT;
 
 	err = OTConnect(s->endpoint, &sndCall, nil);
 
-	tcp_connect_deadline = 0;
-	tcp_connect_ep = kOTInvalidEndpointRef;
-	tcp_connect_session_idx = -1;
+	s->connect_deadline = 0;
 
 	if (err == kOTCanceledErr)
 	{
@@ -906,8 +905,8 @@ void telnet_disconnect(int session_idx)
 	if (s->thread_state != UNINITIALIZED && s->thread_state != DONE)
 	{
 		/* force the connect timeout notifier to cancel immediately */
-		if (tcp_connect_ep == s->endpoint)
-			tcp_connect_deadline = 1;
+		if (s->connect_deadline > 0)
+			s->connect_deadline = 1;
 
 		if (s->endpoint != kOTInvalidEndpointRef)
 			OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
@@ -1026,8 +1025,8 @@ void nc_inline_disconnect(int session_idx)
 	if (s->thread_state != UNINITIALIZED && s->thread_state != DONE)
 	{
 		/* force the connect timeout notifier to cancel immediately */
-		if (tcp_connect_ep == s->endpoint)
-			tcp_connect_deadline = 1;
+		if (s->connect_deadline > 0)
+			s->connect_deadline = 1;
 
 		if (s->endpoint != kOTInvalidEndpointRef)
 			OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);

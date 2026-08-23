@@ -981,6 +981,7 @@ void init_session(struct session* s)
 	s->channel = NULL;
 	s->ssh_session = NULL;
 	s->endpoint = kOTInvalidEndpointRef;
+	s->connect_deadline = 0;
 	s->recv_buffer = NULL;
 	s->send_buffer = NULL;
 	s->telnet_host[0] = '\0';
