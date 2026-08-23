@@ -2643,14 +2643,144 @@ static int is_ip_address(const char* s)
 	return dots == 3;
 }
 
-static void cmd_host(int idx, int argc, char* argv[])
+/* DNR notifier for the host command.  The DNS query runs asynchronously;
+   the notifier (called at system task time) flags completion.  context is
+   the session index. */
+pascal void host_dnr_notifier(void* context, OTEventCode event,
+                              OTResult result, void* cookie)
 {
-	/* DNS lookup using OT Internet Services */
-	InetSvcRef inet_svc;
-	InetHostInfo host_info;
+	int idx = (int)(long)context;
+	struct session* s;
+
+	(void)cookie;
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	s = &sessions[idx];
+	if (event == T_DNRSTRINGTOADDRCOMPLETE || event == T_DNRADDRTONAMECOMPLETE)
+	{
+		s->host_err = result;
+		s->host_done = 1;
+	}
+}
+
+/* pump the async DNS query: yield to keep the main thread (and the whole
+   machine) responsive, stop on completion, Ctrl+C, or the hard deadline. */
+static void host_pump(int idx, struct session* s, unsigned long deadline)
+{
+	(void)idx;
+	while (!s->host_done && s->thread_command != EXIT)
+	{
+		if (TickCount() > deadline) break;
+		YieldToAnyThread();
+	}
+}
+
+static void* host_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
+	InetSvcRef inet_svc = NULL;
 	OSStatus err;
 	int i;
 	char ip_str[16];
+	unsigned long deadline;
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "host: Open Transport not available\r\n");
+		goto host_worker_done;
+	}
+
+	inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
+	if (err != noErr || inet_svc == NULL)
+	{
+		printf_s(idx, "host: failed to open internet services (err=%d)\r\n", (int)err);
+		goto host_worker_done;
+	}
+
+	/* ASYNC mode.  Internet-services DNR calls never deliver kOTSyncIdleEvent
+	   and cannot be cancelled by OTCancelSynchronousCalls, so a BLOCKING call
+	   spins inside OT without yielding and freezes the whole machine for the
+	   OS DNS timeout (the bug being fixed).  In async mode the call returns
+	   immediately and completes via the notifier; we pump with
+	   YieldToAnyThread so the main thread keeps running, and enforce a hard
+	   deadline. */
+	OTSetAsynchronous(inet_svc);
+	OTInstallNotifier(inet_svc, host_dnr_notifier, (void*)(long)idx);
+
+	s->host_done = 0;
+	s->host_err = noErr;
+	deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	if (s->host_reverse)
+	{
+		InetHost addr;
+
+		err = OTInetStringToHost(s->host_query, &addr);
+		if (err != noErr)
+		{
+			printf_s(idx, "host: invalid address \"%s\"\r\n", s->host_query);
+			OTCloseProvider(inet_svc);
+			goto host_worker_done;
+		}
+
+		printf_s(idx, "Reverse lookup %s... ", s->host_query);
+		err = OTInetAddressToName(inet_svc, addr, s->host_name);
+		if (err == kOTNoDataErr || err == noErr)
+			host_pump(idx, s, deadline);
+
+		if (s->thread_command == EXIT)
+			printf_s(idx, "(cancelled)\r\n");
+		else if (s->host_done && s->host_err == noErr)
+			printf_s(idx, "%s\r\n", s->host_name);
+		else if (!s->host_done)
+			printf_s(idx, "timed out\r\n");
+		else
+			printf_s(idx, "failed (err=%d)\r\n", (int)s->host_err);
+	}
+	else
+	{
+		printf_s(idx, "Resolving \"%s\"... ", s->host_query);
+		err = OTInetStringToAddress(inet_svc, s->host_query, &s->host_hinfo);
+		if (err == kOTNoDataErr || err == noErr)
+			host_pump(idx, s, deadline);
+
+		if (s->thread_command == EXIT)
+			printf_s(idx, "(cancelled)\r\n");
+		else if (s->host_done && s->host_err == noErr)
+		{
+			vt_write(idx, "\r\n");
+			for (i = 0; i < kMaxHostAddrs; i++)
+			{
+				if (s->host_hinfo.addrs[i] == 0) break;
+				OTInetHostToString(s->host_hinfo.addrs[i], ip_str);
+				printf_s(idx, "  %s has address %s\r\n", s->host_hinfo.name, ip_str);
+			}
+		}
+		else if (!s->host_done)
+			printf_s(idx, "timed out\r\n");
+		else
+			printf_s(idx, "failed (err=%d)\r\n", (int)s->host_err);
+	}
+
+	/* closing the provider cancels any outstanding query */
+	OTCloseProvider(inet_svc);
+
+host_worker_done:
+	s->worker_mode = WORKER_NONE;
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	if (s->in_use && s->type == SESSION_LOCAL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+static void cmd_host(int idx, int argc, char* argv[])
+{
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
 
 	if (argc < 2)
 	{
@@ -2658,105 +2788,45 @@ static void cmd_host(int idx, int argc, char* argv[])
 		return;
 	}
 
-	/* reverse lookup if it's an IP address */
-	if (is_ip_address(argv[1]))
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
 	{
-		InetHost addr;
-		InetDomainName name;
-
-		if (InitOpenTransport() != noErr)
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
 		{
-			vt_write(idx, "host: Open Transport not available\r\n");
+			vt_write(idx, "host: previous worker thread could not be reclaimed\r\n");
 			return;
 		}
-		err = OTInetStringToHost(argv[1], &addr);
-		if (err != noErr)
-		{
-			printf_s(idx, "host: invalid address \"%s\"\r\n", argv[1]);
-			return;
-		}
+	}
 
-		inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
-		if (err != noErr || inet_svc == NULL)
-		{
-			printf_s(idx, "host: failed to open internet services (err=%d)\r\n", (int)err);
-			return;
-		}
-
-		OTSetSynchronous(inet_svc);
-		OTSetBlocking(inet_svc);
-		OTInstallNotifier(inet_svc, shell_ot_timeout_notifier, nil);
-		OTUseSyncIdleEvents(inet_svc, true);
-
-		printf_s(idx, "Reverse lookup %s... ", argv[1]);
-
-		ot_timeout_provider = inet_svc;
-		ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
-
-		err = OTInetAddressToName(inet_svc, addr, name);
-
-		ot_timeout_deadline = 0;
-		ot_timeout_provider = nil;
-
-		if (err == noErr)
-			printf_s(idx, "%s\r\n", name);
-		else if (err == kOTCanceledErr)
-			vt_write(idx, "timed out\r\n");
-		else
-			printf_s(idx, "failed (err=%d)\r\n", (int)err);
-
-		OTCloseProvider(inet_svc);
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "host: another local command is already running\r\n");
 		return;
 	}
 
-	if (InitOpenTransport() != noErr)
+	/* snapshot query state for the worker thread */
+	copy_cstr_trunc(s->host_query, sizeof(s->host_query), argv[1]);
+	s->host_reverse = is_ip_address(argv[1]) ? 1 : 0;
+
+	/* spawn the DNS worker thread (keeps the main thread responsive) */
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
+
+	err = NewThread(kCooperativeThread, host_worker_thread,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
+	                kCreateIfNeeded, NULL, &tid);
+	if (err != noErr)
 	{
-		vt_write(idx, "host: Open Transport not available\r\n");
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "host: failed to create worker thread (err=%d)\r\n", (int)err);
 		return;
 	}
 
-	inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
-	if (err != noErr || inet_svc == NULL)
-	{
-		printf_s(idx, "host: failed to open internet services (err=%d)\r\n", (int)err);
-		return;
-	}
-
-	OTSetSynchronous(inet_svc);
-	OTSetBlocking(inet_svc);
-	OTInstallNotifier(inet_svc, shell_ot_timeout_notifier, nil);
-	OTUseSyncIdleEvents(inet_svc, true);
-
-	printf_s(idx, "Resolving \"%s\"... ", argv[1]);
-
-	ot_timeout_provider = inet_svc;
-	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
-
-	err = OTInetStringToAddress(inet_svc, argv[1], &host_info);
-
-	ot_timeout_deadline = 0;
-	ot_timeout_provider = nil;
-
-	if (err == kOTCanceledErr)
-	{
-		vt_write(idx, "timed out\r\n");
-	}
-	else if (err != noErr)
-	{
-		printf_s(idx, "failed (err=%d)\r\n", (int)err);
-	}
-	else
-	{
-		vt_write(idx, "\r\n");
-		for (i = 0; i < kMaxHostAddrs; i++)
-		{
-			if (host_info.addrs[i] == 0) break;
-			OTInetHostToString(host_info.addrs[i], ip_str);
-			printf_s(idx, "  %s has address %s\r\n", host_info.name, ip_str);
-		}
-	}
-
-	OTCloseProvider(inet_svc);
+	s->thread_id = tid;
+	s->worker_mode = WORKER_HOST;
 }
 
 static void cmd_ifconfig(int idx, int argc, char* argv[])

@@ -12,6 +12,7 @@
 #include "unicode.h"
 
 #include <string.h>
+#include <stdio.h>
 
 #include <Sound.h>
 #include <Resources.h>
