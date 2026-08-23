@@ -618,6 +618,46 @@ void ssh_end_msg_callback(LIBSSH2_SESSION* session, int reason, const char *mess
 	printf_i("got a disconnect msg\r\n");
 }
 
+/* connect timeout: 30 seconds (1800 ticks).  set before OTConnect,
+   cleared after.  the notifier cancels the blocking call if exceeded.
+   Stored per-session (sessions[].connect_deadline) so concurrent SSH
+   connects don't clobber each other's notifier state. */
+#define SSH_CONNECT_TIMEOUT  1800
+
+/* OT notifier: yields to cooperative threads during blocking OTConnect,
+   keeping the machine responsive (same pattern as telnet.c).
+   Called at system task time with kOTSyncIdleEvent when
+   OTUseSyncIdleEvents is true.  Cancels on timeout or when disconnect
+   sets thread_command=EXIT.  `context` is the session index, installed
+   per-endpoint, so each connecting session tracks its own deadline. */
+pascal void ssh_ot_notifier(void* context, OTEventCode event,
+                            OTResult result, void* cookie)
+{
+	int idx = (int)(intptr_t)context;
+	struct session* s = &sessions[idx];
+	(void)result;
+	(void)cookie;
+	if (event == kOTSyncIdleEvent)
+	{
+		YieldToAnyThread();
+		if (s->endpoint != kOTInvalidEndpointRef && s->connect_deadline > 0)
+		{
+			int cancel = 0;
+
+			/* timeout expired */
+			if (TickCount() > s->connect_deadline)
+				cancel = 1;
+
+			/* disconnect requested */
+			if (s->thread_command == EXIT)
+				cancel = 1;
+
+			if (cancel)
+				OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
+		}
+	}
+}
+
 int init_connection(int session_idx, char* hostname)
 {
 	struct session* s = &sessions[session_idx];
@@ -640,11 +680,11 @@ int init_connection(int session_idx, char* hostname)
 
 	OT_CHECK(OTSetSynchronous(s->endpoint));
 	OT_CHECK(OTSetBlocking(s->endpoint));
-	OT_CHECK(OTUseSyncIdleEvents(s->endpoint, false));
+	OT_CHECK(OTInstallNotifier(s->endpoint, ssh_ot_notifier,
+	                           (void*)(intptr_t)session_idx));
+	OT_CHECK(OTUseSyncIdleEvents(s->endpoint, true));
 
 	OT_CHECK(OTBind(s->endpoint, nil, nil));
-
-	OT_CHECK(OTSetNonBlocking(s->endpoint));
 
 	// set up address struct, do the DNS lookup, and connect
 	OTMemzero(&sndCall, sizeof(TCall));
@@ -653,13 +693,63 @@ int init_connection(int session_idx, char* hostname)
 	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, (char *) hostname);
 
 	printf_s(session_idx, "Connecting to endpoint \"%s\"... ", hostname); YieldToAnyThread();
+
+	/* OTConnect blocks during DNS + TCP handshake.
+	   The idle notifier yields to other threads during the wait.
+	   A 30-second timeout prevents hanging on unreachable hosts.
+	   Deadline is per-session so a concurrent connect on another
+	   session can't overwrite this one's notifier state. */
+	s->connect_deadline = TickCount() + SSH_CONNECT_TIMEOUT;
+
 	err = OTConnect(s->endpoint, &sndCall, nil);
+
+	s->connect_deadline = 0;
+
+	if (err == kOTCanceledErr)
+	{
+		if (s->thread_command == EXIT)
+			printf_s(session_idx, "cancelled.\r\n");
+		else
+			printf_s(session_idx, "timed out.\r\n");
+		OTUnbind(s->endpoint);
+		OTCloseProvider(s->endpoint);
+		s->endpoint = kOTInvalidEndpointRef;
+		return 0;
+	}
+
+	if (err == kOTLookErr)
+	{
+		/* event arrived during connect (e.g. connection refused) */
+		OTResult ev = OTLook(s->endpoint);
+		if (ev == T_DISCONNECT)
+		{
+			OTRcvDisconnect(s->endpoint, nil);
+			printf_s(session_idx, "connection refused.\r\n");
+		}
+		else
+		{
+			printf_s(session_idx, "failed (event=%d)\r\n", (int)ev);
+		}
+		OTUnbind(s->endpoint);
+		OTCloseProvider(s->endpoint);
+		s->endpoint = kOTInvalidEndpointRef;
+		return 0;
+	}
+
 	if (err != noErr)
 	{
 		printf_s(session_idx, "OTConnect failed (err=%d)\r\n", (int)err);
+		OTUnbind(s->endpoint);
+		OTCloseProvider(s->endpoint);
+		s->endpoint = kOTInvalidEndpointRef;
 		return 0;
 	}
 	printf_s(session_idx, "done.\r\n"); YieldToAnyThread();
+
+	/* switch to non-blocking for reads — disable idle events so OTRcv
+	   returns kOTNoDataErr instead of blocking with idle callbacks */
+	OTUseSyncIdleEvents(s->endpoint, false);
+	OTSetNonBlocking(s->endpoint);
 
 	// init libssh2
 	SSH_CHECK(libssh2_init(0));

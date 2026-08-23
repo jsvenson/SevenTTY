@@ -42,7 +42,7 @@ enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
-enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP };
+enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP, WORKER_HOST };
 
 // per-session state (terminal + connection + thread)
 struct session
@@ -76,6 +76,11 @@ struct session
 	EndpointRef endpoint;
 	char* recv_buffer;
 	char* send_buffer;
+
+	// OT connect timeout state (used only while blocking OTConnect).
+	// Per-session so concurrent connects don't clobber each other's
+	// notifier state (net.c ssh_ot_notifier / telnet.c tcp_ot_notifier).
+	unsigned long connect_deadline; /* 0 = not connecting */
 
 	// telnet/nc connection (SESSION_TELNET/SESSION_NETCAT only)
 	char telnet_host[256];
@@ -141,6 +146,16 @@ struct session
 	long ftp_local_file_size;         /* upload source size */
 	unsigned char ftp_direction;      /* 0=get, 1=put, 2=ls */
 	unsigned char ftp_no_progress;
+
+	// host command (DNS) worker state: set by cmd_host() before spawn.
+	// The DNS query runs ASYNC in a worker thread; the DNR notifier sets
+	// host_done/host_err when it completes.
+	char host_query[256];
+	unsigned char host_reverse;   /* 1 = reverse lookup (IP -> name) */
+	unsigned char host_done;      /* set by DNR notifier when query completes */
+	OSStatus host_err;            /* result code delivered to the notifier */
+	InetHostInfo host_hinfo;      /* forward lookup result */
+	InetDomainName host_name;     /* reverse lookup result */
 
 	// multi-file FTP upload (glob expansion)
 	char ftp_glob_pattern[64];   // glob pattern, "" = single file
