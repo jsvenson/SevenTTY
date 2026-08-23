@@ -2733,7 +2733,12 @@ static void* host_worker_thread(void* arg)
 		else if (s->host_done && s->host_err == noErr)
 			printf_s(idx, "%s\r\n", s->host_name);
 		else if (!s->host_done)
-			printf_s(idx, "timed out\r\n");
+		{
+			if (err != noErr && err != kOTNoDataErr)
+				printf_s(idx, "failed (err=%d)\r\n", (int)err);
+			else
+				printf_s(idx, "timed out\r\n");
+		}
 		else
 			printf_s(idx, "failed (err=%d)\r\n", (int)s->host_err);
 	}
@@ -2757,7 +2762,12 @@ static void* host_worker_thread(void* arg)
 			}
 		}
 		else if (!s->host_done)
-			printf_s(idx, "timed out\r\n");
+		{
+			if (err != noErr && err != kOTNoDataErr)
+				printf_s(idx, "failed (err=%d)\r\n", (int)err);
+			else
+				printf_s(idx, "timed out\r\n");
+		}
 		else
 			printf_s(idx, "failed (err=%d)\r\n", (int)s->host_err);
 	}
