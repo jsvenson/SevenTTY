@@ -1283,7 +1283,19 @@ void close_session(int idx)
 			else if (s->thread_id != kNoThreadID)
 			{
 				s->thread_command = EXIT;
-				if (s->endpoint != kOTInvalidEndpointRef)
+
+				if (s->worker_mode == WORKER_HOST && s->endpoint != kOTInvalidEndpointRef)
+				{
+					/* Async DNR queries can't be cancelled by
+					   OTCancelSynchronousCalls; only closing the provider
+					   cancels the outstanding query and removes the notifier.
+					   The worker stores the ref before its first yield and only
+					   yields inside host_pump (never mid-OT-call), so closing
+					   it from the main thread here is safe. */
+					OTCloseProvider((ProviderRef)s->endpoint);
+					s->endpoint = kOTInvalidEndpointRef;
+				}
+				else if (s->endpoint != kOTInvalidEndpointRef)
 					OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
 
 				if (!session_reap_thread(idx, 0))

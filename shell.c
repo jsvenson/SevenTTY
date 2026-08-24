@@ -2697,6 +2697,12 @@ static void* host_worker_thread(void* arg)
 		goto host_worker_done;
 	}
 
+	/* Publish the provider so close_session can close it if this worker is
+	   force-stopped mid-lookup (see host_worker_done).  Stored before the
+	   first YieldToAnyThread, so it is always valid whenever the main thread
+	   can observe this worker. */
+	s->endpoint = inet_svc;
+
 	/* ASYNC mode.  Internet-services DNR calls never deliver kOTSyncIdleEvent
 	   and cannot be cancelled by OTCancelSynchronousCalls, so a BLOCKING call
 	   spins inside OT without yielding and freezes the whole machine for the
@@ -2720,6 +2726,7 @@ static void* host_worker_thread(void* arg)
 		{
 			printf_s(idx, "host: invalid address \"%s\"\r\n", s->host_query);
 			OTCloseProvider(inet_svc);
+			s->endpoint = kOTInvalidEndpointRef;
 			goto host_worker_done;
 		}
 
@@ -2774,6 +2781,8 @@ static void* host_worker_thread(void* arg)
 
 	/* closing the provider cancels any outstanding query */
 	OTCloseProvider(inet_svc);
+	/* drop the published ref so close_session won't double-close */
+	s->endpoint = kOTInvalidEndpointRef;
 
 host_worker_done:
 	s->worker_mode = WORKER_NONE;
