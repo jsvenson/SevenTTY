@@ -2779,10 +2779,15 @@ static void* host_worker_thread(void* arg)
 			printf_s(idx, "failed (err=%d)\r\n", (int)s->host_err);
 	}
 
-	/* closing the provider cancels any outstanding query */
-	OTCloseProvider(inet_svc);
-	/* drop the published ref so close_session won't double-close */
-	s->endpoint = kOTInvalidEndpointRef;
+	/* closing the provider cancels any outstanding query.  Guard on the
+	   published ref: close_session may already have closed it and cleared
+	   s->endpoint when force-stopping this worker. */
+	if (s->endpoint != kOTInvalidEndpointRef)
+	{
+		OTCloseProvider(inet_svc);
+		/* drop the published ref so close_session won't double-close */
+		s->endpoint = kOTInvalidEndpointRef;
+	}
 
 host_worker_done:
 	s->worker_mode = WORKER_NONE;
