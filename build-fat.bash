@@ -39,7 +39,7 @@ rm -rf build-fat
 mkdir build-fat
 
 $RETRO68_PATH/toolchain/bin/Rez \
-$RETRO68_PATH/toolchain/m68k-apple-macos/RIncludes/RetroPPCAPPL.r \
+fat.r \
 -I$RETRO68_PATH/toolchain/m68k-apple-macos/RIncludes \
 -DCFRAG_NAME="\"SevenTTY\"" \
 --copy build-m68k/SevenTTY.code.bin \
