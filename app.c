@@ -1250,26 +1250,24 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	return idx;
 }
 
-void close_session(int idx)
+/* Shared per-session teardown used by both close_session and close_window.
+   Disconnects any network session or local worker thread (including the
+   WORKER_HOST provider-close path), then frees the session's vterm and
+   dynamic buffers. Does NOT mark in_use=0 or remove the session from its
+   window — the caller does that so it can do window-level bookkeeping. */
+static void teardown_session(int idx)
 {
-	if (idx < 0 || idx >= MAX_SESSIONS) return;
-	if (!sessions[idx].in_use) return;
-
-	struct window_context* wc = window_for_session(idx);
-	if (wc == NULL) return;
-	if (wc->num_sessions <= 1) return; // don't close the last session in a window
+	struct session* s = &sessions[idx];
 
 	// disconnect networked sessions (waits for thread to reach DONE)
-	if (sessions[idx].type == SESSION_SSH &&
-		(sessions[idx].thread_state != DONE || sessions[idx].thread_id != kNoThreadID))
+	if (s->type == SESSION_SSH &&
+		(s->thread_state != DONE || s->thread_id != kNoThreadID))
 		ssh_disconnect(idx);
-	else if (sessions[idx].type == SESSION_TELNET &&
-		(sessions[idx].thread_state != DONE || sessions[idx].thread_id != kNoThreadID))
+	else if (s->type == SESSION_TELNET &&
+		(s->thread_state != DONE || s->thread_id != kNoThreadID))
 		telnet_disconnect(idx);
-	else if (sessions[idx].type == SESSION_LOCAL)
+	else if (s->type == SESSION_LOCAL)
 	{
-		struct session* s = &sessions[idx];
-
 		/* nc inline mode has its own disconnect lifecycle. */
 		if (s->worker_mode == WORKER_NC)
 		{
@@ -1283,7 +1281,19 @@ void close_session(int idx)
 			else if (s->thread_id != kNoThreadID)
 			{
 				s->thread_command = EXIT;
-				if (s->endpoint != kOTInvalidEndpointRef)
+
+				if (s->worker_mode == WORKER_HOST && s->endpoint != kOTInvalidEndpointRef)
+				{
+					/* Async DNR queries can't be cancelled by
+					   OTCancelSynchronousCalls; only closing the provider
+					   cancels the outstanding query and removes the notifier.
+					   The worker stores the ref before its first yield and only
+					   yields inside host_pump (never mid-OT-call), so closing
+					   it from the main thread here is safe. */
+					OTCloseProvider((ProviderRef)s->endpoint);
+					s->endpoint = kOTInvalidEndpointRef;
+				}
+				else if (s->endpoint != kOTInvalidEndpointRef)
 					OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
 
 				if (!session_reap_thread(idx, 0))
@@ -1299,34 +1309,47 @@ void close_session(int idx)
 	}
 
 	// null out vterm callbacks to prevent use during teardown
-	if (sessions[idx].vterm != NULL)
+	if (s->vterm != NULL)
 	{
-		VTermScreen* vts = vterm_obtain_screen(sessions[idx].vterm);
+		VTermScreen* vts = vterm_obtain_screen(s->vterm);
 		vterm_screen_set_callbacks(vts, NULL, NULL);
-		vterm_output_set_callback(sessions[idx].vterm, NULL, NULL);
+		vterm_output_set_callback(s->vterm, NULL, NULL);
 	}
 
 	/* free vterm only if thread is confirmed done;
 	   if thread timed out, leak rather than use-after-free */
-	if (sessions[idx].vterm != NULL &&
-		sessions[idx].thread_state == DONE &&
-		sessions[idx].thread_id == kNoThreadID)
+	if (s->vterm != NULL &&
+		s->thread_state == DONE &&
+		s->thread_id == kNoThreadID)
 	{
-		vterm_free(sessions[idx].vterm);
-		sessions[idx].vterm = NULL;
+		vterm_free(s->vterm);
+		s->vterm = NULL;
 	}
 
 	/* free dynamic buffers */
-	if (sessions[idx].scrollback != NULL)
+	if (s->scrollback != NULL)
 	{
-		DisposePtr((Ptr)sessions[idx].scrollback);
-		sessions[idx].scrollback = NULL;
+		DisposePtr((Ptr)s->scrollback);
+		s->scrollback = NULL;
 	}
-	if (sessions[idx].shell_history != NULL)
+	if (s->shell_history != NULL)
 	{
-		DisposePtr((Ptr)sessions[idx].shell_history);
-		sessions[idx].shell_history = NULL;
+		DisposePtr((Ptr)s->shell_history);
+		s->shell_history = NULL;
 	}
+}
+
+void close_session(int idx)
+{
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	if (!sessions[idx].in_use) return;
+
+	struct window_context* wc = window_for_session(idx);
+	if (wc == NULL) return;
+	if (wc->num_sessions <= 1) return; // don't close the last session in a window
+
+	// disconnect + free per-session resources
+	teardown_session(idx);
 
 	sessions[idx].in_use = 0;
 	remove_session_from_window(wc, idx);
@@ -1508,61 +1531,8 @@ void close_window(int wid)
 	{
 		int sid = wc->session_ids[0];
 
-		// disconnect networked sessions (waits for thread to reach DONE)
-		if (sessions[sid].type == SESSION_SSH &&
-			(sessions[sid].thread_state != DONE || sessions[sid].thread_id != kNoThreadID))
-			ssh_disconnect(sid);
-		else if (sessions[sid].type == SESSION_TELNET &&
-			(sessions[sid].thread_state != DONE || sessions[sid].thread_id != kNoThreadID))
-			telnet_disconnect(sid);
-		else if (sessions[sid].type == SESSION_LOCAL)
-		{
-			struct session* s = &sessions[sid];
-
-			/* nc inline mode has its own disconnect lifecycle. */
-			if (s->worker_mode == WORKER_NC)
-			{
-				nc_inline_disconnect(sid);
-			}
-			else
-			{
-				/* local worker commands (e.g. wget, scp) share thread state fields. */
-				if (s->thread_state == DONE && s->thread_id != kNoThreadID)
-					session_reap_thread(sid, 0);
-				else if (s->thread_id != kNoThreadID)
-				{
-					s->thread_command = EXIT;
-					if (s->endpoint != kOTInvalidEndpointRef)
-						OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
-
-					if (!session_reap_thread(sid, 0))
-						session_reap_thread(sid, 1);
-
-					if (s->thread_id != kNoThreadID)
-						printf_s(sid, "Warning: local worker thread could not be reclaimed.\r\n");
-				}
-			}
-			/* plain local shell (no worker thread) — mark DONE so slot is reusable */
-			if (s->thread_id == kNoThreadID)
-				s->thread_state = DONE;
-		}
-
-		// null out vterm callbacks to prevent use during teardown
-		if (sessions[sid].vterm != NULL)
-		{
-			VTermScreen* vts = vterm_obtain_screen(sessions[sid].vterm);
-			vterm_screen_set_callbacks(vts, NULL, NULL);
-			vterm_output_set_callback(sessions[sid].vterm, NULL, NULL);
-		}
-
-		/* free vterm only if thread is confirmed done */
-		if (sessions[sid].vterm != NULL &&
-			sessions[sid].thread_state == DONE &&
-			sessions[sid].thread_id == kNoThreadID)
-		{
-			vterm_free(sessions[sid].vterm);
-			sessions[sid].vterm = NULL;
-		}
+		// disconnect + free per-session resources
+		teardown_session(sid);
 
 		sessions[sid].in_use = 0;
 		remove_session_from_window(wc, sid);
