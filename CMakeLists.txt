@@ -12,6 +12,11 @@ add_application(SevenTTY CREATOR "SSH7" app.c console.c resources.r symbolfont.r
 set(ENABLE_PROGRAMS OFF CACHE BOOL "disable mbedtls programs" FORCE)
 set(UNSAFE_BUILD ON CACHE BOOL "ignore mac os jank for mbedtls" FORCE)
 set(ENABLE_TESTING OFF CACHE BOOL "disable mbedtls tests" FORCE)
+# GCC 16 flags mbedtls's fixed-width TLS 1.3 labels (e.g. char[6] = "tls13 ")
+# as a truncated-NUL error under -Werror. mbedtls drops the NUL on these byte
+# labels deliberately, so downgrade just this warning; keep -Werror for all
+# other warnings. Without this, fresh builds fail on modern toolchains.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=unterminated-string-initialization")
 add_subdirectory(opentransport-mbedtls)
 
 # set up and build libssh2
