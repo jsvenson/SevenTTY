@@ -5177,7 +5177,10 @@ static void cmd_xxd(int idx, int argc, char** argv)
 								p++;
 
 								if (hi >= 0 && lo >= 0)
+								{
+									if (out_count >= (long)sizeof(outbuf)) break;
 									outbuf[out_count++] = (unsigned char)((hi << 4) | lo);
+								}
 							}
 
 							if (out_count > 0)
