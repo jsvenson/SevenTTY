@@ -1282,14 +1282,15 @@ static void teardown_session(int idx)
 			{
 				s->thread_command = EXIT;
 
-				if (s->worker_mode == WORKER_HOST && s->endpoint != kOTInvalidEndpointRef)
+				if (s->worker_mode == WORKER_HOST || s->worker_mode == WORKER_PING)
 				{
-					/* Async DNR queries can't be cancelled by
-					   OTCancelSynchronousCalls; only closing the provider
-					   cancels the outstanding query and removes the notifier.
-					   The worker stores the ref before its first yield and only
-					   yields inside host_pump (never mid-OT-call), so closing
-					   it from the main thread here is safe. */
+					/* Async operations (DNR query for host, connect for ping)
+					   can't be cancelled by OTCancelSynchronousCalls; only
+					   closing the provider cancels the outstanding call and
+					   removes the notifier.  The worker stores the ref before
+					   its first yield and only yields inside its pump (never
+					   mid-OT-call), so closing it from the main thread here is
+					   safe. */
 					OTCloseProvider((ProviderRef)s->endpoint);
 					s->endpoint = kOTInvalidEndpointRef;
 				}

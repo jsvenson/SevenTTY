@@ -42,7 +42,7 @@ enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
-enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP, WORKER_HOST };
+enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP, WORKER_HOST, WORKER_PING };
 
 // per-session state (terminal + connection + thread)
 struct session
@@ -156,6 +156,15 @@ struct session
 	OSStatus host_err;            /* result code delivered to the notifier */
 	InetHostInfo host_hinfo;      /* forward lookup result */
 	InetDomainName host_name;     /* reverse lookup result */
+
+	// ping command (TCP connect test) worker state: set by cmd_ping() before
+	// spawn, read/written by the worker.  The connect runs ASYNC in a worker
+	// thread so an unreachable host can't stall the main thread; the notifier
+	// sets ping_done/ping_ok and pulls the disconnect reason.
+	char ping_host[280];     /* "host:port" string for the worker */
+	unsigned char ping_done; /* set by notifier when the connect completes */
+	unsigned char ping_ok;   /* 1 = connected */
+	int ping_reason;         /* TDiscon.reason on failure */
 
 	// multi-file FTP upload (glob expansion)
 	char ftp_glob_pattern[64];   // glob pattern, "" = single file

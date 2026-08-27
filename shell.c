@@ -2899,15 +2899,195 @@ static void cmd_ifconfig(int idx, int argc, char* argv[])
 		vt_write(idx, "No network interfaces found.\r\n");
 }
 
-static void cmd_ping(int idx, int argc, char* argv[])
+/* map a TCP/IP disconnect reason to a short string.
+   OTConnect's TDiscon.reason is a POSITIVE XTI/errno-style code
+   ("discon->reason contains a positive error code that indicates why the
+   connection was rejected").  The ECONN* symbols are not visible here
+   because OpenTransport.h only defines them under OTKERNEL/OTUNIXERRORS,
+   so use the literal values. */
+static const char* ot_disconnect_reason(OTReason reason)
 {
-	/* TCP connect test — measures DNS + TCP handshake time */
+	switch (reason)
+	{
+		case 61:  return "connection refused";      /* ECONNREFUSED  */
+		case 54:  return "connection reset by peer"; /* ECONNRESET   */
+		case 53:  return "connection aborted";      /* ECONNABORTED */
+		case 51:  return "network unreachable";     /* ENETUNREACH  */
+		case 65:  return "no route to host";        /* EHOSTUNREACH */
+		case 50:  return "network is down";         /* ENETDOWN     */
+		case 60:  return "connection timed out";    /* ETIMEDOUT    */
+		default:  return NULL;
+	}
+}
+
+/* ping (TCP connect test) async notifier.  The connect runs in ASYNC mode in
+   a worker thread so an unreachable host cannot stall the main thread for the
+   full OS TCP timeout.  T_CONNECT = connected; T_DISCONNECT = refused /
+   unreachable; the notifier pulls the disconnect reason via OTRcvDisconnect
+   (Inside Macintosh: after a failed connect, call OTRcvDisconnect to identify
+   the cause).  context is the session index. */
+pascal void ping_ot_notifier(void* context, OTEventCode event,
+                             OTResult result, void* cookie)
+{
+	int idx = (int)(long)context;
+	struct session* s;
+	TDiscon discon;
+	(void)result;
+	(void)cookie;
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	s = &sessions[idx];
+
+	if (event == T_CONNECT)
+	{
+		s->ping_done = 1;
+		s->ping_ok = 1;
+	}
+	else if (event == T_DISCONNECT)
+	{
+		s->ping_done = 1;
+		s->ping_ok = 0;
+		s->ping_reason = 0;
+		if (s->endpoint != kOTInvalidEndpointRef)
+		{
+			OTMemzero(&discon, sizeof(TDiscon));
+			if (OTRcvDisconnect((EndpointRef)s->endpoint, &discon) == noErr)
+				s->ping_reason = (int)discon.reason;
+		}
+	}
+}
+
+/* pump the async connect: yield so the main thread keeps running (it services
+   the notifier), stop on completion, Ctrl+C, or the hard deadline. */
+static void ping_pump(struct session* s, unsigned long deadline)
+{
+	while (!s->ping_done && s->thread_command != EXIT)
+	{
+		if (TickCount() > deadline) break;
+		YieldToAnyThread();
+	}
+}
+
+static void* ping_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
 	EndpointRef ep;
 	OSStatus err;
 	TCall sndCall;
 	DNSAddress hostDNSAddress;
-	char hostport[280];
-	long start_ticks, elapsed;
+	const char* reason_str;
+	unsigned long deadline;
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "ping: Open Transport not available\r\n");
+		goto ping_worker_done;
+	}
+
+	ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, nil, &err);
+	if (err != noErr)
+	{
+		printf_s(idx, "ping: failed to open endpoint (err=%d)\r\n", (int)err);
+		goto ping_worker_done;
+	}
+
+	/* publish the provider so close_session can cancel on force-stop */
+	s->endpoint = ep;
+
+	/* Bind synchronously (ephemeral port, no network wait), then switch to
+	   ASYNC for the connect.  In async mode OTConnect returns immediately
+	   (kOTNoDataErr) and completes via the notifier — independent of
+	   kOTSyncIdleEvent, which a blocking connect to a silently-dropped host
+	   never delivers.  We pump with YieldToAnyThread and enforce a hard
+	   deadline, so the main thread is never stalled. */
+	OTSetSynchronous(ep);
+	OTSetBlocking(ep);
+
+	err = OTBind(ep, nil, nil);
+	if (err != noErr)
+	{
+		printf_s(idx, "ping: bind failed (err=%d)\r\n", (int)err);
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		goto ping_worker_done;
+	}
+
+	OTSetAsynchronous(ep);
+	OTInstallNotifier(ep, ping_ot_notifier, (void*)(long)idx);
+
+	OTMemzero(&sndCall, sizeof(TCall));
+	sndCall.addr.buf = (UInt8 *) &hostDNSAddress;
+	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, s->ping_host);
+
+	printf_s(idx, "Connecting to %s... ", s->ping_host);
+
+	s->ping_done = 0;
+	s->ping_ok = 0;
+	s->ping_reason = 0;
+	deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	err = OTConnect(ep, &sndCall, nil);
+	if (err == noErr)
+	{
+		/* connected synchronously; the notifier may also deliver T_CONNECT */
+		s->ping_done = 1;
+		s->ping_ok = 1;
+	}
+	else if (err != kOTNoDataErr && err != kOTLookErr)
+	{
+		printf_s(idx, "failed (err=%d)\r\n", (int)err);
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		goto ping_worker_done;
+	}
+
+	ping_pump(s, deadline);
+
+	if (s->thread_command == EXIT)
+		printf_s(idx, "(cancelled)\r\n");
+	else if (s->ping_done && s->ping_ok)
+		printf_s(idx, "connected\r\n");
+	else if (s->ping_done)
+	{
+		reason_str = ot_disconnect_reason((OTReason)s->ping_reason);
+		if (reason_str != NULL)
+			printf_s(idx, "connection failed: %s\r\n", reason_str);
+		else
+			printf_s(idx, "connection failed (reason=%d)\r\n", s->ping_reason);
+	}
+	else
+		printf_s(idx, "timed out\r\n");
+
+	/* closing the provider cancels any outstanding connect.  Guard on the
+	   published ref: close_session may already have closed it on force-stop. */
+	if (s->endpoint != kOTInvalidEndpointRef)
+	{
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+	}
+
+ping_worker_done:
+	s->worker_mode = WORKER_NONE;
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	if (s->in_use && s->type == SESSION_LOCAL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+static void cmd_ping(int idx, int argc, char* argv[])
+{
+	/* TCP connect test — measures DNS + TCP handshake time.
+	   Runs the connect in a WORKER THREAD in async mode so an unreachable
+	   host cannot stall the main thread (and the whole machine).  A blocking
+	   OTConnect to a silently-dropped host never delivers kOTSyncIdleEvent,
+	   so neither a blocking connect nor a non-blocking OTLook poll returns
+	   until the full OS TCP timeout (~60 s), freezing the UI. */
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
 	unsigned short port;
 
 	if (argc < 2)
@@ -2916,68 +3096,45 @@ static void cmd_ping(int idx, int argc, char* argv[])
 		return;
 	}
 
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			vt_write(idx, "ping: previous worker thread could not be reclaimed\r\n");
+			return;
+		}
+	}
+
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "ping: another local command is already running\r\n");
+		return;
+	}
+
 	port = (argc >= 3) ? (unsigned short)atoi(argv[2]) : 80;
-	snprintf(hostport, sizeof(hostport), "%s:%d", argv[1], (int)port);
+	snprintf(s->ping_host, sizeof(s->ping_host), "%s:%d", argv[1], (int)port);
 
-	if (InitOpenTransport() != noErr)
-	{
-		vt_write(idx, "ping: Open Transport not available\r\n");
-		return;
-	}
+	/* spawn the connect worker thread; cmd_ping returns immediately so the
+	   main thread keeps servicing the UI and the notifier. */
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
 
-	ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, nil, &err);
+	err = NewThread(kCooperativeThread, ping_worker_thread,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
+	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
-		printf_s(idx, "ping: failed to open endpoint (err=%d)\r\n", (int)err);
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "ping: failed to create worker thread (err=%d)\r\n", (int)err);
 		return;
 	}
 
-	OTSetSynchronous(ep);
-	OTSetBlocking(ep);
-	OTInstallNotifier(ep, shell_ot_timeout_notifier, nil);
-	OTUseSyncIdleEvents(ep, true);
-
-	err = OTBind(ep, nil, nil);
-	if (err != noErr)
-	{
-		printf_s(idx, "ping: bind failed (err=%d)\r\n", (int)err);
-		OTCloseProvider(ep);
-		return;
-	}
-
-	OTMemzero(&sndCall, sizeof(TCall));
-	sndCall.addr.buf = (UInt8 *) &hostDNSAddress;
-	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, hostport);
-
-	printf_s(idx, "Connecting to %s... ", hostport);
-
-	ot_timeout_provider = ep;
-	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
-
-	start_ticks = TickCount();
-	err = OTConnect(ep, &sndCall, nil);
-	elapsed = TickCount() - start_ticks;
-
-	ot_timeout_deadline = 0;
-	ot_timeout_provider = nil;
-
-	if (err == noErr)
-	{
-		printf_s(idx, "connected (%ld ticks, ~%ldms)\r\n",
-		         elapsed, elapsed * 1000 / 60);
-		OTSndOrderlyDisconnect(ep);
-	}
-	else if (err == kOTCanceledErr)
-	{
-		vt_write(idx, "timed out\r\n");
-	}
-	else
-	{
-		printf_s(idx, "failed (err=%d, %ld ticks)\r\n", (int)err, elapsed);
-	}
-
-	OTUnbind(ep);
-	OTCloseProvider(ep);
+	s->thread_id = tid;
+	s->worker_mode = WORKER_PING;
 }
 
 static void cmd_colors(int idx, int argc, char* argv[])
