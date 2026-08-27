@@ -37,24 +37,3 @@ data 'cfrg' (0) {
 	$"00000000 00000000 0034"               /* reserved, reserved, entryLength */
 	$"08 536576656e545459 00"               /* pstring "SevenTTY" + pad to 52B */
 };
-
-resource 'SIZE' (-1) {
-	reserved,
-	ignoreSuspendResumeEvents,
-	reserved,
-	cannotBackground,
-	needsActivateOnFGSwitch,
-	backgroundAndForeground,
-	dontGetFrontClicks,
-	ignoreChildDiedEvents,
-	is32BitCompatible,
-	notHighLevelEventAware,
-	onlyLocalHLEvents,
-	notStationeryAware,
-	dontUseTextEditServices,
-	reserved,
-	reserved,
-	reserved,
-	1024 * 1024,
-	1024 * 1024
-};
