@@ -10,6 +10,7 @@
 
 #include "app.h"
 #include "shell.h"
+#include "shell_util.h"
 #include "console.h"
 #include "debug.h"
 #include "net.h"
@@ -61,7 +62,6 @@ pascal void shell_ot_timeout_notifier(void* context, OTEventCode event,
 }
 
 /* max arguments for a command */
-#define MAX_ARGS 32
 
 /* forward declarations */
 void shell_prompt(int idx);
@@ -426,68 +426,6 @@ static long get_dir_id(FSSpec* spec)
 }
 
 /* ------------------------------------------------------------------ */
-/* argument parsing                                                   */
-/* ------------------------------------------------------------------ */
-
-/* parse a command line into argc/argv, handling quoting and backslash escapes.
-   modifies line in-place to collapse escape sequences. */
-static int parse_args(char* line, char* argv[], int max_args)
-{
-	int argc = 0;
-	char* p = line;
-
-	while (*p && argc < max_args)
-	{
-		/* skip whitespace */
-		while (*p == ' ' || *p == '\t') p++;
-		if (*p == '\0') break;
-
-		if (*p == '"')
-		{
-			/* quoted arg */
-			p++;
-			argv[argc++] = p;
-			while (*p && *p != '"') p++;
-			if (*p == '"') *p++ = '\0';
-		}
-		else if (*p == '\'')
-		{
-			p++;
-			argv[argc++] = p;
-			while (*p && *p != '\'') p++;
-			if (*p == '\'') *p++ = '\0';
-		}
-		else
-		{
-			/* unquoted arg: handle backslash-escaped spaces */
-			char* dst = p;
-			argv[argc++] = dst;
-			while (*p)
-			{
-				if (*p == '\\' && *(p+1) == ' ')
-				{
-					/* escaped space: collapse to literal space */
-					*dst++ = ' ';
-					p += 2;
-				}
-				else if (*p == ' ' || *p == '\t')
-				{
-					break; /* unescaped whitespace = end of arg */
-				}
-				else
-				{
-					*dst++ = *p++;
-				}
-			}
-			if (*p) { *dst = '\0'; p++; }
-			else { *dst = '\0'; }
-		}
-	}
-
-	return argc;
-}
-
-/* ------------------------------------------------------------------ */
 /* date formatting helper                                             */
 /* ------------------------------------------------------------------ */
 
@@ -514,31 +452,6 @@ static void format_date(unsigned long secs, char* out, int maxlen)
 
 static int lookup_ext_type(const char* filename, OSType* type, OSType* creator);
 
-static void ostype_to_str(OSType t, char* out)
-{
-	out[0] = (t >> 24) & 0xFF;
-	out[1] = (t >> 16) & 0xFF;
-	out[2] = (t >> 8)  & 0xFF;
-	out[3] = t & 0xFF;
-	out[4] = '\0';
-
-	/* replace non-printable with '?' */
-	{
-		int i;
-		for (i = 0; i < 4; i++)
-			if (out[i] < 32 || out[i] > 126) out[i] = '?';
-	}
-}
-
-static OSType str_to_ostype(const char* s)
-{
-	char buf[4] = { ' ', ' ', ' ', ' ' };
-	int i;
-	for (i = 0; i < 4 && s[i]; i++) buf[i] = s[i];
-	return ((OSType)buf[0] << 24) | ((OSType)buf[1] << 16) |
-	       ((OSType)buf[2] << 8) | (OSType)buf[3];
-}
-
 /* ------------------------------------------------------------------ */
 /* commands                                                           */
 /* ------------------------------------------------------------------ */
@@ -551,39 +464,6 @@ static const char* ls_color(int is_dir, int is_locked, int is_invis, OSType ftyp
 	if (is_locked)             return "\033[1;31m"; /* bold red */
 	if (ftype == 0x4150504C)   return "\033[1;32m"; /* APPL: bold green */
 	return "";
-}
-
-/* simple glob match: supports * and ? only, case-insensitive */
-static int glob_match(const char* pattern, const char* str)
-{
-	while (*pattern)
-	{
-		if (*pattern == '*')
-		{
-			pattern++;
-			if (!*pattern) return 1; /* trailing * matches everything */
-			while (*str)
-			{
-				if (glob_match(pattern, str)) return 1;
-				str++;
-			}
-			return 0;
-		}
-		else if (*pattern == '?')
-		{
-			if (!*str) return 0;
-			pattern++;
-			str++;
-		}
-		else
-		{
-			if (tolower((unsigned char)*pattern) != tolower((unsigned char)*str))
-				return 0;
-			pattern++;
-			str++;
-		}
-	}
-	return *str == '\0';
 }
 
 /* ls with glob pattern: enumerate directory, filter by pattern */
@@ -2159,21 +2039,6 @@ static void cmd_label(int idx, int argc, char* argv[])
 	/* label is bits 1-3 of fdFlags */
 	finfo.fdFlags = (finfo.fdFlags & ~0x0E) | ((lab & 0x07) << 1);
 	FSpSetFInfo(&spec, &finfo);
-}
-
-/* format bytes as human-readable string: "1.5 MB", "320 KB", etc. */
-static void fmt_human(char* buf, int bufsz, long bytes)
-{
-	if (bytes >= 1024L * 1024L * 1024L)
-		snprintf(buf, bufsz, "%ld.%ld GB",
-			bytes / (1024L * 1024L * 1024L),
-			(bytes / (1024L * 1024L * 100L)) % 10);
-	else if (bytes >= 1024L * 1024L)
-		snprintf(buf, bufsz, "%ld.%ld MB",
-			bytes / (1024L * 1024L),
-			(bytes / (1024L * 100L)) % 10);
-	else
-		snprintf(buf, bufsz, "%ld KB", bytes / 1024L);
 }
 
 static void cmd_df(int idx, int argc, char* argv[])
