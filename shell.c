@@ -2789,7 +2789,7 @@ static const char* ot_disconnect_reason(OTReason reason)
    unreachable; the notifier pulls the disconnect reason via OTRcvDisconnect
    (Inside Macintosh: after a failed connect, call OTRcvDisconnect to identify
    the cause).  context is the session index. */
-pascal void ping_ot_notifier(void* context, OTEventCode event,
+pascal void pingtcp_ot_notifier(void* context, OTEventCode event,
                              OTResult result, void* cookie)
 {
 	int idx = (int)(long)context;
@@ -2830,7 +2830,7 @@ static void ping_pump(struct session* s, unsigned long deadline)
 	}
 }
 
-static void* ping_worker_thread(void* arg)
+static void* pingtcp_worker_thread(void* arg)
 {
 	int idx = (int)(long)arg;
 	struct session* s = &sessions[idx];
@@ -2876,7 +2876,7 @@ static void* ping_worker_thread(void* arg)
 	}
 
 	OTSetAsynchronous(ep);
-	OTInstallNotifier(ep, ping_ot_notifier, (void*)(long)idx);
+	OTInstallNotifier(ep, pingtcp_ot_notifier, (void*)(long)idx);
 
 	OTMemzero(&sndCall, sizeof(TCall));
 	sndCall.addr.buf = (UInt8 *) &hostDNSAddress;
@@ -2940,7 +2940,7 @@ ping_worker_done:
 	return 0;
 }
 
-static void cmd_ping(int idx, int argc, char* argv[])
+static void cmd_pingtcp(int idx, int argc, char* argv[])
 {
 	/* TCP connect test — measures DNS + TCP handshake time.
 	   Runs the connect in a WORKER THREAD in async mode so an unreachable
@@ -2955,7 +2955,7 @@ static void cmd_ping(int idx, int argc, char* argv[])
 
 	if (argc < 2)
 	{
-		vt_write(idx, "usage: ping <host> [port]  (TCP connect test, default port 80)\r\n");
+		vt_write(idx, "usage: pingtcp <host> [port]  (TCP connect test, default port 80)\r\n");
 		return;
 	}
 
@@ -2978,13 +2978,13 @@ static void cmd_ping(int idx, int argc, char* argv[])
 	port = (argc >= 3) ? (unsigned short)atoi(argv[2]) : 80;
 	snprintf(s->ping_host, sizeof(s->ping_host), "%s:%d", argv[1], (int)port);
 
-	/* spawn the connect worker thread; cmd_ping returns immediately so the
+	/* spawn the connect worker thread; cmd_pingtcp returns immediately so the
 	   main thread keeps servicing the UI and the notifier. */
 	s->thread_command = READ;
 	s->thread_state = OPEN;
 	s->endpoint = kOTInvalidEndpointRef;
 
-	err = NewThread(kCooperativeThread, ping_worker_thread,
+	err = NewThread(kCooperativeThread, pingtcp_worker_thread,
 	                (void*)(long)idx, THREAD_STACK_WORKER,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
@@ -9529,7 +9529,8 @@ static void cmd_help(int idx, int argc, char* argv[])
 		"    ftp ls u@h:/path/    FTP directory list",
 		"    nc <host> <port>   raw TCP connection",
 		"    host <hostname>    DNS lookup",
-		"    ping <host> [port] TCP connect test",
+		"    ping <host> [-c n] [-i sec] [-s size]  ICMP echo ping",
+		"    pingtcp <host> [port]                  TCP connect test",
 		"    ifconfig           show network config",
 		"    colors             display color test",
 		"    help               this message",
@@ -9601,7 +9602,7 @@ static const char* shell_commands[] = {
 	"fixtype", "fold", "free", "ftp", "getinfo", "grep", "head", "help", "hexdump",
 	"history", "host", "hostname", "ifconfig", "info", "label", "less",
 	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
-	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
+	"nl", "open", "ping", "pingtcp", "ps", "pwd", "quit", "rd", "readlink",
 	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "scp", "seq",
 	"setcreator", "settype", "sha1sum", "sha256sum", "sha512sum", "sleep",
 	"ssh", "strings", "tail", "telnet", "touch", "type", "uname",
@@ -10231,7 +10232,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "nc") == 0)        cmd_nc(idx, argc, argv);
 	else if (strcmp(cmd, "host") == 0)      cmd_host(idx, argc, argv);
 	else if (strcmp(cmd, "ifconfig") == 0)  cmd_ifconfig(idx, argc, argv);
-	else if (strcmp(cmd, "ping") == 0)      cmd_ping(idx, argc, argv);
+	else if (strcmp(cmd, "pingtcp") == 0)   cmd_pingtcp(idx, argc, argv);
 	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
 	else if (strcmp(cmd, "open") == 0)      cmd_open(idx, argc, argv);
 	else if (strcmp(cmd, "md5sum") == 0)    cmd_md5sum(idx, argc, argv);
