@@ -61,8 +61,6 @@ pascal void shell_ot_timeout_notifier(void* context, OTEventCode event,
 	}
 }
 
-/* max arguments for a command */
-
 /* forward declarations */
 void shell_prompt(int idx);
 static void shell_execute(int idx, char* line);
