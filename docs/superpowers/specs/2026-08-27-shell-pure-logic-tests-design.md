@@ -1,7 +1,7 @@
 # Design: Host-side unit tests for shell pure-logic helpers
 
 Date: 2026-08-27
-Status: Approved (in brainstorming)
+Status: Implemented
 
 ## Summary
 
