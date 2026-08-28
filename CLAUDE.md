@@ -38,6 +38,13 @@ cmake --build . --parallel $(nproc)
 ./build-fat.bash
 ```
 
+Host-side unit tests for the pure shell logic (compiles `tests/test_shell_util.c` +
+`shell_util.c` with `cc`; exits nonzero on any failure):
+
+```bash
+./tools/run_host_tests.sh
+```
+
 Build outputs: `SevenTTY.bin` (MacBinary), `SevenTTY.dsk` (HFS disk image), `SevenTTY.APPL` (raw application)
 
 ### Deploy to QEMU Emulator
@@ -70,6 +77,10 @@ Do NOT modify files inside these submodule directories.
 | `console.h` | ~42 | Console function prototypes (incl. `output_callback`) |
 | `shell.c` | ~10400 | Local shell: 30+ commands (ls, cd, cat, cp, mv, rm, mkdir, ps, free, df, etc.), tab completion, history, FTP client, wget/scp file transfer |
 | `shell.h` | ~12 | Shell function prototypes |
+| `shell_util.h` | ~18 | Public prototypes + `MAX_ARGS` for the pure-logic helpers (`parse_args`, `glob_match`, `fmt_human`, `ostype_to_str`, `str_to_ostype`); uses `uint32_t` for OSType params |
+| `shell_util.c` | ~141 | Dependency-free (pure) helpers moved out of `shell.c`; compiled by BOTH the Retro68 build and the host test harness (tested code == shipped code) |
+| `tests/test_shell_util.c` | ~129 | Host-side C89 assert harness for `shell_util.c`; run via `./tools/run_host_tests.sh` |
+| `tools/run_host_tests.sh` | ~7 | Compiles `tests/test_shell_util.c` + `shell_util.c` with `cc` and runs them; exits nonzero on any failure |
 | `telnet.c` | ~985 | Telnet and raw TCP (nc): OT connection, telnet IAC negotiation, read threads, inline nc |
 | `telnet.h` | ~17 | Telnet/nc function prototypes (incl. `tcp_output_callback`) |
 | `net.c` | ~730 | SSH networking: Open Transport TCP, libssh2 session, read thread, known hosts, EAGAIN handling |

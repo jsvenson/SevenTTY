@@ -1,0 +1,7 @@
+#!/bin/sh
+# Host-side unit tests for shell_util.c. Standalone by design: uses only cc and
+# does not touch the Retro68 CMake build (which has known stale-cache footguns).
+cd "$(dirname "$0")/.." || exit 1
+cc -std=c89 -Wall -Wextra -I. -o /tmp/seventty_host_tests \
+    tests/test_shell_util.c shell_util.c
+/tmp/seventty_host_tests
