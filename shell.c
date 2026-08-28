@@ -3030,8 +3030,11 @@ static void* icmp_worker_thread(void* arg)
 	}
 
 icmp_worker_done:
-	if (inet_svc != NULL)
+	if (inet_svc != NULL && s->endpoint != kOTInvalidEndpointRef)
+	{
 		OTCloseProvider(inet_svc);
+		s->endpoint = kOTInvalidEndpointRef;
+	}
 	if (s->endpoint != kOTInvalidEndpointRef)
 	{
 		OTCloseProvider(ep);
