@@ -10661,8 +10661,13 @@ static void shell_execute(int idx, char* line)
 		}
 	}
 
-	/* close redirect unless nc took over (it runs async) */
-	if (sessions[idx].worker_mode != WORKER_NC)
+	/* close redirect unless an async worker took over (it runs after we
+	   return; closing now would drop its redirected output).  nc, the two
+	   ping workers and the DNR/host worker all write post-dispatch. */
+	if (sessions[idx].worker_mode != WORKER_NC &&
+	    sessions[idx].worker_mode != WORKER_ICMP &&
+	    sessions[idx].worker_mode != WORKER_PING &&
+	    sessions[idx].worker_mode != WORKER_HOST)
 		redir_close(idx);
 }
 
