@@ -42,7 +42,7 @@ enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
-enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP, WORKER_HOST, WORKER_PING };
+enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP, WORKER_HOST, WORKER_PING, WORKER_ICMP };
 
 // per-session state (terminal + connection + thread)
 struct session
@@ -165,6 +165,24 @@ struct session
 	unsigned char ping_done; /* set by notifier when the connect completes */
 	unsigned char ping_ok;   /* 1 = connected */
 	int ping_reason;         /* TDiscon.reason on failure */
+
+	// ICMP ping command (real ICMP echo) worker state: set by cmd_ping()
+	// before spawn, read/written by the worker. The RawIP send/receive runs
+	// ASYNC in a worker thread; the notifier sets ping_rcv_event on T_DATA,
+	// which the worker's receive loop waits on so it wakes when a datagram
+	// arrives instead of polling until the deadline.
+	char ping_target[256];        /* host string for DNR resolution */
+	int ping_count;               /* packets to send (default 4) */
+	long ping_interval_ms;        /* ms between packets (default 1000) */
+	int ping_payload;             /* payload bytes (default 56) */
+	unsigned short ping_id;       /* ICMP identifier for this run */
+	unsigned short ping_seq;      /* current sequence number */
+	unsigned char ping_rcv_event; /* set by notifier on T_DATA; worker waits on it */
+	int ping_sent;                /* packets transmitted */
+	int ping_recv;                /* echo replies received */
+	unsigned long ping_rtt_min;   /* min/avg/max RTT (avg via sum/recv) */
+	unsigned long ping_rtt_sum;
+	unsigned long ping_rtt_max;
 
 	// multi-file FTP upload (glob expansion)
 	char ftp_glob_pattern[64];   // glob pattern, "" = single file

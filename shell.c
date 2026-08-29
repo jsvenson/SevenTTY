@@ -11,6 +11,7 @@
 #include "app.h"
 #include "shell.h"
 #include "shell_util.h"
+#include "icmp_util.h"
 #include "console.h"
 #include "debug.h"
 #include "net.h"
@@ -26,6 +27,7 @@
 #include <TextUtils.h>
 #include <Threads.h>
 #include <Aliases.h>
+#include <Timer.h>
 
 #include <mbedtls/md5.h>
 #include <mbedtls/sha1.h>
@@ -36,6 +38,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+
+/* async worker threads (host/ping/pingtcp) close the redirect on completion */
+static void redir_close(int idx);
 
 /* timeout notifier for blocking OT calls in main thread (ping, host) */
 #define OT_TIMEOUT_TICKS  600  /* 10 seconds at 60 ticks/sec */
@@ -2657,6 +2662,8 @@ host_worker_done:
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
 
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
+
 	if (s->in_use && s->type == SESSION_LOCAL)
 		shell_prompt(idx);
 
@@ -2783,13 +2790,378 @@ static const char* ot_disconnect_reason(OTReason reason)
 	}
 }
 
+/* ICMP ping defaults / limits */
+#define PING_DEFAULT_COUNT        4
+#define PING_DEFAULT_INTERVAL_MS  1000
+#define PING_DEFAULT_PAYLOAD      56
+#define PING_MAX_PAYLOAD          1472   /* stay under Ethernet MTU with headers */
+#define PING_MIN_INTERVAL_MS      200
+#define PING_PKT_TIMEOUT_TICKS    90     /* ~1.5 s wait for a reply per packet */
+
+/* ICMP ping RawIP notifier: connectionless, so the only event we care about
+   is T_DATA (an inbound ICMP datagram). context is the session index. */
+pascal void ping_ot_notifier(void* context, OTEventCode event,
+                             OTResult result, void* cookie)
+{
+	int idx = (int)(long)context;
+	struct session* s;
+
+	(void)result;
+	(void)cookie;
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	s = &sessions[idx];
+	if (event == T_DATA)
+		s->ping_rcv_event = 1;
+}
+
+/* ICMP ping worker thread. Resolves the host via the async DNR pattern
+   (host_dnr_notifier), then drives RawIP send/receive in ASYNC mode so a
+   silent host can never stall the main thread. The worker pumps with
+   YieldToAnyThread and enforces hard deadlines on both phases. */
+static void* icmp_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
+	InetSvcRef inet_svc = NULL;
+	EndpointRef ep = kOTInvalidEndpointRef;
+	OSStatus err;
+	InetHost target_ip = 0;
+	unsigned long deadline;
+	unsigned char recvbuf[PING_MAX_PAYLOAD + 64]; /* IP hdr + max ICMP msg */
+	unsigned char sendbuf[PING_MAX_PAYLOAD + 8];
+	TUnitData udata;
+	TUnitData rdata;
+	OTFlags flags;
+	InetAddress destAddr;
+	int seq, pkt;
+	int timed_out;
+	unsigned long sent_ms, now_ms;
+	UnsignedWide uw;
+	enum icmp_result res;
+	struct icmp_reply_info info;
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "ping: Open Transport not available\r\n");
+		goto icmp_worker_done;
+	}
+
+	/* --- resolve host (async DNR, reusing the host command's pattern) --- */
+	inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
+	if (err != noErr || inet_svc == NULL)
+	{
+		printf_s(idx, "ping: failed to open internet services (err=%d)\r\n", (int)err);
+		goto icmp_worker_done;
+	}
+	s->endpoint = inet_svc;
+	OTSetAsynchronous(inet_svc);
+	OTInstallNotifier(inet_svc, host_dnr_notifier, (void*)(long)idx);
+	s->host_done = 0;
+	s->host_err = noErr;
+	deadline = TickCount() + OT_TIMEOUT_TICKS;
+	printf_s(idx, "Pinging %s... ", s->ping_target);
+	err = OTInetStringToAddress(inet_svc, s->ping_target, &s->host_hinfo);
+	if (err == kOTNoDataErr || err == noErr)
+		host_pump(idx, s, deadline);
+	if (s->thread_command == EXIT)
+	{
+		vt_write(idx, "(cancelled)\r\n");
+		goto icmp_worker_done;
+	}
+	if (!s->host_done || s->host_err != noErr || s->host_hinfo.addrs[0] == 0)
+	{
+		vt_write(idx, "host not found\r\n");
+		goto icmp_worker_done;
+	}
+	target_ip = s->host_hinfo.addrs[0];
+	OTCloseProvider(inet_svc);
+	s->endpoint = kOTInvalidEndpointRef;
+	inet_svc = NULL;
+	{
+		char ip_str[16];
+		OTInetHostToString(target_ip, ip_str);
+		printf_s(idx, "(%s)\r\n", ip_str);
+	}
+
+	/* --- open RawIP endpoint (default protocol = ICMP 1) --- */
+	ep = OTOpenEndpoint(OTCreateConfiguration(kRawIPName), 0, nil, &err);
+	if (err != noErr || ep == kOTInvalidEndpointRef)
+	{
+		printf_s(idx, "ping: failed to open RawIP endpoint (err=%d)\r\n", (int)err);
+		goto icmp_worker_done;
+	}
+	s->endpoint = ep;
+
+	OTSetSynchronous(ep);
+	OTSetBlocking(ep);
+	err = OTBind(ep, nil, nil);
+	if (err != noErr)
+	{
+		printf_s(idx, "ping: bind failed (err=%d)\r\n", (int)err);
+		goto icmp_worker_done;
+	}
+	OTSetAsynchronous(ep);
+	OTInstallNotifier(ep, ping_ot_notifier, (void*)(long)idx);
+
+	/* --- send/receive loop --- */
+	s->ping_id = (unsigned short)(TickCount() & 0xFFFF);
+	s->ping_sent = 0;
+	s->ping_recv = 0;
+	s->ping_rtt_min = 0;
+	s->ping_rtt_sum = 0;
+	s->ping_rtt_max = 0;
+
+	for (pkt = 0; pkt < s->ping_count; pkt++)
+	{
+		unsigned long pkt_deadline;
+
+		if (s->thread_command == EXIT)
+		{
+			vt_write(idx, "(cancelled)\r\n");
+			break;
+		}
+
+		seq = pkt + 1;
+		s->ping_seq = (unsigned short)seq;
+
+		/* measure send time in ms */
+		Microseconds(&uw);
+		sent_ms = (unsigned long)((((unsigned long long)uw.hi) << 32 | uw.lo) / 1000ULL);
+
+		{
+			int msglen = icmp_build_echo_request(sendbuf, s->ping_payload,
+			                                     s->ping_id, s->ping_seq, sent_ms);
+			OTMemzero(&udata, sizeof(TUnitData));
+			OTMemzero(&destAddr, sizeof(InetAddress));
+			destAddr.fAddressType = AF_INET; /* required to route to non-loopback */
+			destAddr.fHost = target_ip;
+			destAddr.fPort = 0;
+			udata.addr.buf = (UInt8*)&destAddr;
+			udata.addr.len = sizeof(destAddr);
+			udata.udata.buf = sendbuf;
+			udata.udata.len = msglen;
+			flags = 0;
+			(void)OTSndUData(ep, &udata);
+		}
+		s->ping_sent++;
+
+		/* wait up to PING_PKT_TIMEOUT_TICKS for a matching reply.  The
+		   notifier sets ping_rcv_event on T_DATA (a datagram arrived), so
+		   gate the wait on it: yield until an event fires or the packet
+		   deadline expires, then drain.  Gating on the event rather than
+		   busy-polling wakes the worker the moment a datagram is queued
+		   instead of polling until the deadline. */
+		s->ping_rcv_event = 0;
+		pkt_deadline = TickCount() + PING_PKT_TIMEOUT_TICKS;
+		timed_out = 1;
+		while (s->thread_command != EXIT && TickCount() <= pkt_deadline)
+		{
+			/* nothing arrived yet: yield so the main thread (and the whole
+			   machine) stays responsive until a datagram or the deadline */
+			if (!s->ping_rcv_event)
+			{
+				YieldToAnyThread();
+				continue;
+			}
+
+			/* a datagram arrived (ping_rcv_event set): drain all pending */
+			s->ping_rcv_event = 0;
+			for (;;)
+			{
+				OTMemzero(&rdata, sizeof(TUnitData));
+				rdata.udata.buf = recvbuf;
+				rdata.udata.maxlen = sizeof(recvbuf);
+				flags = 0;
+				err = OTRcvUData(ep, &rdata, &flags);
+				if (err != noErr) break; /* kOTNoDataErr: nothing pending */
+
+				Microseconds(&uw);
+				now_ms = (unsigned long)((((unsigned long long)uw.hi) << 32 | uw.lo) / 1000ULL);
+				res = icmp_parse_reply(recvbuf, (int)rdata.udata.len,
+				                       s->ping_id, s->ping_seq, now_ms, &info);
+				if (res == ICMP_ECHO_REPLY)
+				{
+					/* "64 bytes from x: icmp_seq=N ttl=T time=X ms" */
+					printf_s(idx, "64 bytes from %s: icmp_seq=%d ttl=%d time=%lu ms\r\n",
+					        info.source_ip, (int)info.seq, info.ttl,
+					        (unsigned long)info.rtt_ms);
+					s->ping_recv++;
+					if (s->ping_rtt_min == 0 || info.rtt_ms < s->ping_rtt_min)
+						s->ping_rtt_min = info.rtt_ms;
+					s->ping_rtt_sum += info.rtt_ms;
+					if (info.rtt_ms > s->ping_rtt_max)
+						s->ping_rtt_max = info.rtt_ms;
+					timed_out = 0;
+					break;
+				}
+				else if (res == ICMP_UNREACHABLE)
+				{
+					printf_s(idx, "From %s icmp_seq=%d Destination Host Unreachable\r\n",
+					        info.source_ip, (int)info.seq);
+					timed_out = 0;
+					break;
+				}
+				else if (res == ICMP_TTL_EXCEEDED)
+				{
+					printf_s(idx, "From %s icmp_seq=%d Time to live exceeded\r\n",
+					        info.source_ip, (int)info.seq);
+					timed_out = 0;
+					break;
+				}
+				/* ICMP_NOT_MINE / ICMP_BAD: ignore and keep draining */
+			}
+			if (!timed_out || s->thread_command == EXIT) break;
+		}
+
+		if (timed_out)
+			printf_s(idx, "Request timeout for icmp_seq=%d\r\n", seq);
+
+		/* pace to the interval between packet starts */
+		{
+			Microseconds(&uw);
+			now_ms = (unsigned long)((((unsigned long long)uw.hi) << 32 | uw.lo) / 1000ULL);
+			if (now_ms - sent_ms < (unsigned long)s->ping_interval_ms)
+			{
+				unsigned long wait_ticks =
+					(unsigned long)(s->ping_interval_ms - (now_ms - sent_ms)) * 60 / 1000;
+				deadline = TickCount() + wait_ticks;
+				while (s->thread_command != EXIT && TickCount() < deadline)
+					YieldToAnyThread();
+			}
+		}
+	}
+
+	/* --- stats --- */
+	{
+		int lost = s->ping_sent - s->ping_recv;
+		int pct = (s->ping_sent > 0) ? (lost * 100 / s->ping_sent) : 0;
+		char ip_str[16];
+		OTInetHostToString(target_ip, ip_str);
+		printf_s(idx, "--- %s ping statistics ---\r\n", ip_str);
+		printf_s(idx, "%d packets transmitted, %d received, %d%% packet loss\r\n",
+		        s->ping_sent, s->ping_recv, pct);
+		if (s->ping_recv > 0)
+			printf_s(idx, "rtt min/avg/max = %lu/%lu/%lu ms\r\n",
+			        s->ping_rtt_min, s->ping_rtt_sum / s->ping_recv, s->ping_rtt_max);
+		else
+			vt_write(idx, "rtt min/avg/max = ---\r\n");
+	}
+
+icmp_worker_done:
+	if (inet_svc != NULL && s->endpoint != kOTInvalidEndpointRef)
+	{
+		OTCloseProvider(inet_svc);
+		s->endpoint = kOTInvalidEndpointRef;
+	}
+	if (s->endpoint != kOTInvalidEndpointRef)
+	{
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+	}
+	s->worker_mode = WORKER_NONE;
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
+
+	if (s->in_use && s->type == SESSION_LOCAL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+static void cmd_ping(int idx, int argc, char* argv[])
+{
+	/* Real ICMP echo ping. Runs entirely in a WORKER THREAD over a RawIP
+	   endpoint in async mode so an unreachable/silent host cannot stall the
+	   main thread. Flags: -c count, -i interval (sec), -s payload size. */
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
+	int count = PING_DEFAULT_COUNT;
+	long interval_ms = PING_DEFAULT_INTERVAL_MS;
+	int payload = PING_DEFAULT_PAYLOAD;
+	int i;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: ping <host> [-c count] [-i interval] [-s size]\r\n");
+		return;
+	}
+
+	for (i = 2; i < argc; i++)
+	{
+		int v;
+		if (argv[i][0] != '-' || argv[i][1] == '\0' || i + 1 >= argc)
+		{
+			vt_write(idx, "usage: ping <host> [-c count] [-i interval] [-s size]\r\n");
+			return;
+		}
+		v = atoi(argv[i + 1]);
+		switch (argv[i][1])
+		{
+			case 'c': count = v; i++; break;
+			case 'i': interval_ms = (long)v * 1000; i++; break;
+			case 's': payload = v; i++; break;
+			default:
+				vt_write(idx, "usage: ping <host> [-c count] [-i interval] [-s size]\r\n");
+				return;
+		}
+	}
+
+	if (count < 1) count = 1;
+	if (payload < 4) payload = 4;
+	if (payload > PING_MAX_PAYLOAD) payload = PING_MAX_PAYLOAD;
+	if (interval_ms < PING_MIN_INTERVAL_MS) interval_ms = PING_MIN_INTERVAL_MS;
+
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			vt_write(idx, "ping: previous worker thread could not be reclaimed\r\n");
+			return;
+		}
+	}
+
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "ping: another local command is already running\r\n");
+		return;
+	}
+
+	copy_cstr_trunc(s->ping_target, sizeof(s->ping_target), argv[1]);
+	s->ping_count = count;
+	s->ping_interval_ms = interval_ms;
+	s->ping_payload = payload;
+
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
+
+	err = NewThread(kCooperativeThread, icmp_worker_thread,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
+	                kCreateIfNeeded, NULL, &tid);
+	if (err != noErr)
+	{
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "ping: failed to create worker thread (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	s->thread_id = tid;
+	s->worker_mode = WORKER_ICMP;
+}
+
 /* ping (TCP connect test) async notifier.  The connect runs in ASYNC mode in
    a worker thread so an unreachable host cannot stall the main thread for the
    full OS TCP timeout.  T_CONNECT = connected; T_DISCONNECT = refused /
    unreachable; the notifier pulls the disconnect reason via OTRcvDisconnect
    (Inside Macintosh: after a failed connect, call OTRcvDisconnect to identify
    the cause).  context is the session index. */
-pascal void ping_ot_notifier(void* context, OTEventCode event,
+pascal void pingtcp_ot_notifier(void* context, OTEventCode event,
                              OTResult result, void* cookie)
 {
 	int idx = (int)(long)context;
@@ -2830,7 +3202,7 @@ static void ping_pump(struct session* s, unsigned long deadline)
 	}
 }
 
-static void* ping_worker_thread(void* arg)
+static void* pingtcp_worker_thread(void* arg)
 {
 	int idx = (int)(long)arg;
 	struct session* s = &sessions[idx];
@@ -2876,7 +3248,7 @@ static void* ping_worker_thread(void* arg)
 	}
 
 	OTSetAsynchronous(ep);
-	OTInstallNotifier(ep, ping_ot_notifier, (void*)(long)idx);
+	OTInstallNotifier(ep, pingtcp_ot_notifier, (void*)(long)idx);
 
 	OTMemzero(&sndCall, sizeof(TCall));
 	sndCall.addr.buf = (UInt8 *) &hostDNSAddress;
@@ -2934,13 +3306,15 @@ ping_worker_done:
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
 
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
+
 	if (s->in_use && s->type == SESSION_LOCAL)
 		shell_prompt(idx);
 
 	return 0;
 }
 
-static void cmd_ping(int idx, int argc, char* argv[])
+static void cmd_pingtcp(int idx, int argc, char* argv[])
 {
 	/* TCP connect test — measures DNS + TCP handshake time.
 	   Runs the connect in a WORKER THREAD in async mode so an unreachable
@@ -2955,7 +3329,7 @@ static void cmd_ping(int idx, int argc, char* argv[])
 
 	if (argc < 2)
 	{
-		vt_write(idx, "usage: ping <host> [port]  (TCP connect test, default port 80)\r\n");
+		vt_write(idx, "usage: pingtcp <host> [port]  (TCP connect test, default port 80)\r\n");
 		return;
 	}
 
@@ -2978,13 +3352,13 @@ static void cmd_ping(int idx, int argc, char* argv[])
 	port = (argc >= 3) ? (unsigned short)atoi(argv[2]) : 80;
 	snprintf(s->ping_host, sizeof(s->ping_host), "%s:%d", argv[1], (int)port);
 
-	/* spawn the connect worker thread; cmd_ping returns immediately so the
+	/* spawn the connect worker thread; cmd_pingtcp returns immediately so the
 	   main thread keeps servicing the UI and the notifier. */
 	s->thread_command = READ;
 	s->thread_state = OPEN;
 	s->endpoint = kOTInvalidEndpointRef;
 
-	err = NewThread(kCooperativeThread, ping_worker_thread,
+	err = NewThread(kCooperativeThread, pingtcp_worker_thread,
 	                (void*)(long)idx, THREAD_STACK_WORKER,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
@@ -9529,7 +9903,8 @@ static void cmd_help(int idx, int argc, char* argv[])
 		"    ftp ls u@h:/path/    FTP directory list",
 		"    nc <host> <port>   raw TCP connection",
 		"    host <hostname>    DNS lookup",
-		"    ping <host> [port] TCP connect test",
+		"    ping <host> [-c n] [-i sec] [-s size]  ICMP echo ping",
+		"    pingtcp <host> [port]                  TCP connect test",
 		"    ifconfig           show network config",
 		"    colors             display color test",
 		"    help               this message",
@@ -9601,7 +9976,7 @@ static const char* shell_commands[] = {
 	"fixtype", "fold", "free", "ftp", "getinfo", "grep", "head", "help", "hexdump",
 	"history", "host", "hostname", "ifconfig", "info", "label", "less",
 	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
-	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
+	"nl", "open", "ping", "pingtcp", "ps", "pwd", "quit", "rd", "readlink",
 	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "scp", "seq",
 	"setcreator", "settype", "sha1sum", "sha256sum", "sha512sum", "sleep",
 	"ssh", "strings", "tail", "telnet", "touch", "type", "uname",
@@ -10232,6 +10607,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "host") == 0)      cmd_host(idx, argc, argv);
 	else if (strcmp(cmd, "ifconfig") == 0)  cmd_ifconfig(idx, argc, argv);
 	else if (strcmp(cmd, "ping") == 0)      cmd_ping(idx, argc, argv);
+	else if (strcmp(cmd, "pingtcp") == 0)   cmd_pingtcp(idx, argc, argv);
 	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
 	else if (strcmp(cmd, "open") == 0)      cmd_open(idx, argc, argv);
 	else if (strcmp(cmd, "md5sum") == 0)    cmd_md5sum(idx, argc, argv);
@@ -10307,8 +10683,13 @@ static void shell_execute(int idx, char* line)
 		}
 	}
 
-	/* close redirect unless nc took over (it runs async) */
-	if (sessions[idx].worker_mode != WORKER_NC)
+	/* close redirect unless an async worker took over (it runs after we
+	   return; closing now would drop its redirected output).  nc, the two
+	   ping workers and the DNR/host worker all write post-dispatch. */
+	if (sessions[idx].worker_mode != WORKER_NC &&
+	    sessions[idx].worker_mode != WORKER_ICMP &&
+	    sessions[idx].worker_mode != WORKER_PING &&
+	    sessions[idx].worker_mode != WORKER_HOST)
 		redir_close(idx);
 }
 

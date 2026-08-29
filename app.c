@@ -1282,7 +1282,8 @@ static void teardown_session(int idx)
 			{
 				s->thread_command = EXIT;
 
-				if (s->worker_mode == WORKER_HOST || s->worker_mode == WORKER_PING)
+				if (s->worker_mode == WORKER_HOST || s->worker_mode == WORKER_PING ||
+				    s->worker_mode == WORKER_ICMP)
 				{
 					/* Async operations (DNR query for host, connect for ping)
 					   can't be cancelled by OTCancelSynchronousCalls; only
