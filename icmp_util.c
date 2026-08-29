@@ -82,7 +82,7 @@ enum icmp_result icmp_parse_reply(const unsigned char* buf, int len,
 	const unsigned char* icmp;
 	int icmp_len;
 	int ihl = 0;
-	unsigned char type, code;
+	unsigned char type;
 	unsigned short id, seq;
 
 	info->source_ip[0] = '\0';
@@ -119,7 +119,6 @@ enum icmp_result icmp_parse_reply(const unsigned char* buf, int len,
 		return ICMP_BAD;
 
 	type = icmp[0];
-	code = icmp[1];
 	id = (unsigned short)((icmp[4] << 8) | icmp[5]);
 	seq = (unsigned short)((icmp[6] << 8) | icmp[7]);
 
@@ -153,8 +152,10 @@ enum icmp_result icmp_parse_reply(const unsigned char* buf, int len,
 				(unsigned short)((icmp[34] << 8) | icmp[35]);
 			if (oid != expect_id || oseq != expect_seq)
 				return ICMP_NOT_MINE;
+			info->seq = oseq;
 		}
-		info->seq = seq;
+		else
+			info->seq = seq;
 		return (type == 3) ? ICMP_UNREACHABLE : ICMP_TTL_EXCEEDED;
 	}
 

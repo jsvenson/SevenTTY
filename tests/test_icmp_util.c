@@ -113,6 +113,16 @@ static void test_parse_errors(void)
 
 	r = icmp_parse_reply(pkt, 36, 0x1234, 1, 0, &info);
 	CHECK(r == ICMP_UNREACHABLE, "type 3 -> unreachable");
+	CHECK(info.seq == 1, "error seq from embedded original header");
+
+	/* error packet with a distinct embedded seq (0x0005): info->seq must
+	   report the embedded original seq, not the error packet's own bytes
+	   (RFC 792 "unused", always 0) */
+	pkt[34] = 0x00; pkt[35] = 0x05;
+	r = icmp_parse_reply(pkt, 36, 0x1234, 5, 0, &info);
+	CHECK(r == ICMP_UNREACHABLE, "type 3 (distinct embedded seq) -> unreachable");
+	CHECK(info.seq == 5, "error seq == embedded original seq");
+	pkt[34] = 0x00; pkt[35] = 0x01;
 
 	/* embedded id mismatch -> not mine */
 	r = icmp_parse_reply(pkt, 36, 0x9999, 1, 0, &info);
