@@ -2933,6 +2933,7 @@ static void* icmp_worker_thread(void* arg)
 			                                     s->ping_id, s->ping_seq, sent_ms);
 			OTMemzero(&udata, sizeof(TUnitData));
 			OTMemzero(&destAddr, sizeof(InetAddress));
+			destAddr.fAddressType = AF_INET; /* required to route to non-loopback */
 			destAddr.fHost = target_ip;
 			destAddr.fPort = 0;
 			udata.addr.buf = (UInt8*)&destAddr;
