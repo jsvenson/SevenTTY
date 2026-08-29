@@ -39,6 +39,9 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+/* async worker threads (host/ping/pingtcp) close the redirect on completion */
+static void redir_close(int idx);
+
 /* timeout notifier for blocking OT calls in main thread (ping, host) */
 #define OT_TIMEOUT_TICKS  600  /* 10 seconds at 60 ticks/sec */
 
@@ -2659,6 +2662,8 @@ host_worker_done:
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
 
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
+
 	if (s->in_use && s->type == SESSION_LOCAL)
 		shell_prompt(idx);
 
@@ -3044,6 +3049,8 @@ icmp_worker_done:
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
 
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
+
 	if (s->in_use && s->type == SESSION_LOCAL)
 		shell_prompt(idx);
 
@@ -3285,6 +3292,8 @@ ping_worker_done:
 	s->worker_mode = WORKER_NONE;
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
+
+	redir_close(idx);   /* async worker wrote post-dispatch; close now */
 
 	if (s->in_use && s->type == SESSION_LOCAL)
 		shell_prompt(idx);
