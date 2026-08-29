@@ -2945,13 +2945,27 @@ static void* icmp_worker_thread(void* arg)
 		}
 		s->ping_sent++;
 
-		/* wait up to PING_PKT_TIMEOUT_TICKS for a matching reply */
+		/* wait up to PING_PKT_TIMEOUT_TICKS for a matching reply.  The
+		   notifier sets ping_rcv_event on T_DATA (a datagram arrived), so
+		   gate the wait on it: yield until an event fires or the packet
+		   deadline expires, then drain.  Gating on the event rather than
+		   busy-polling wakes the worker the moment a datagram is queued
+		   instead of polling until the deadline. */
 		s->ping_rcv_event = 0;
 		pkt_deadline = TickCount() + PING_PKT_TIMEOUT_TICKS;
 		timed_out = 1;
 		while (s->thread_command != EXIT && TickCount() <= pkt_deadline)
 		{
-			/* drain all pending datagrams */
+			/* nothing arrived yet: yield so the main thread (and the whole
+			   machine) stays responsive until a datagram or the deadline */
+			if (!s->ping_rcv_event)
+			{
+				YieldToAnyThread();
+				continue;
+			}
+
+			/* a datagram arrived (ping_rcv_event set): drain all pending */
+			s->ping_rcv_event = 0;
 			for (;;)
 			{
 				OTMemzero(&rdata, sizeof(TUnitData));
@@ -2997,8 +3011,6 @@ static void* icmp_worker_thread(void* arg)
 				/* ICMP_NOT_MINE / ICMP_BAD: ignore and keep draining */
 			}
 			if (!timed_out || s->thread_command == EXIT) break;
-			s->ping_rcv_event = 0;
-			YieldToAnyThread();
 		}
 
 		if (timed_out)

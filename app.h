@@ -168,14 +168,16 @@ struct session
 
 	// ICMP ping command (real ICMP echo) worker state: set by cmd_ping()
 	// before spawn, read/written by the worker. The RawIP send/receive runs
-	// ASYNC in a worker thread; the notifier sets ping_rcv_event on T_DATA.
+	// ASYNC in a worker thread; the notifier sets ping_rcv_event on T_DATA,
+	// which the worker's receive loop waits on so it wakes when a datagram
+	// arrives instead of polling until the deadline.
 	char ping_target[256];        /* host string for DNR resolution */
 	int ping_count;               /* packets to send (default 4) */
 	long ping_interval_ms;        /* ms between packets (default 1000) */
 	int ping_payload;             /* payload bytes (default 56) */
 	unsigned short ping_id;       /* ICMP identifier for this run */
 	unsigned short ping_seq;      /* current sequence number */
-	unsigned char ping_rcv_event; /* set by notifier when a datagram arrives */
+	unsigned char ping_rcv_event; /* set by notifier on T_DATA; worker waits on it */
 	int ping_sent;                /* packets transmitted */
 	int ping_recv;                /* echo replies received */
 	unsigned long ping_rtt_min;   /* min/avg/max RTT (avg via sum/recv) */
